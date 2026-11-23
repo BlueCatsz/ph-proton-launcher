@@ -8,7 +8,12 @@ import sys
 from collections.abc import Sequence
 
 from . import __version__
-from .config import AppConfig, load_config
+from .config import AppConfig, load_config, save_config
+from .downloader import (
+    TOOL_PROCESS_HACKER,
+    TOOL_SYSTEM_INFORMER,
+    download_and_install_tool,
+)
 from .launcher import run_auto_launch
 from .steam import SteamGame, detect_running_games
 
@@ -18,14 +23,15 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="ph-proton-launcher",
         description=(
-            "Launch Process Hacker inside a running Steam Proton prefix via protontricks-launch."
+            "Launch Process Hacker or System Informer inside a running Steam Proton "
+            "prefix via protontricks-launch."
         ),
     )
     parser.add_argument(
         "--auto",
         action="store_true",
         help=(
-            "Silently launch Process Hacker if exactly 1 running Steam game is detected; "
+            "Silently launch if exactly 1 running Steam game is detected; "
             "otherwise open the GUI window."
         ),
     )
@@ -33,6 +39,15 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--verbose",
         action="store_true",
         help="Open the GUI window with the Verbose Log drawer expanded.",
+    )
+    parser.add_argument(
+        "--download",
+        choices=(TOOL_PROCESS_HACKER, TOOL_SYSTEM_INFORMER),
+        metavar="TOOL",
+        help=(
+            "Download and verify a portable copy of 'process-hacker' (2.39) or "
+            "'system-informer' (latest stable), save its path to config, and exit."
+        ),
     )
     parser.add_argument(
         "--version",
@@ -47,6 +62,21 @@ def _lazy_show_error_dialog(title: str, message: str, details: str = "") -> None
     from .ui import show_error_dialog
 
     show_error_dialog(title, message, details)
+
+
+def _run_download_cli(tool_key: str, config: AppConfig) -> int:
+    """Download a portable tool in CLI mode and save its path to config."""
+    try:
+        result = download_and_install_tool(tool_key)
+    except Exception as exc:
+        print(f"Download failed: {exc}", file=sys.stderr)
+        return 1
+
+    config.process_hacker_exe = str(result.exe_path)
+    save_path = save_config(config)
+    print(f"Installed {result.display_name} ({result.version}) to {result.exe_path}")
+    print(f"Saved config to {save_path}")
+    return 0
 
 
 def _run_gui(
@@ -74,6 +104,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     """Application entrypoint."""
     args = parse_args(argv)
     config = load_config()
+
+    if args.download:
+        return _run_download_cli(args.download, config)
+
     games = detect_running_games()
 
     if args.auto and len(games) == 1:

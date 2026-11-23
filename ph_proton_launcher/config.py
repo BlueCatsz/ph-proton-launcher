@@ -8,6 +8,9 @@ import tempfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+from .downloader import get_tools_dir
+
+
 def get_default_config_path() -> Path:
     """Return the persistent config file path respecting ``XDG_CONFIG_HOME``."""
     xdg_config = os.environ.get("XDG_CONFIG_HOME", "").strip()
@@ -19,11 +22,23 @@ DEFAULT_CONFIG_PATH = get_default_config_path()
 DEFAULT_PROCESS_HACKER_EXE = str(
     Path.home() / "ProcessHacker" / "x64" / "ProcessHacker.exe"
 )
-DEFAULT_EXE_CANDIDATES = (
-    Path.home() / "ProcessHacker" / "x64" / "ProcessHacker.exe",
-    Path.home() / "SystemInformer" / "amd64" / "SystemInformer.exe",
-    Path.home() / "SystemInformer" / "x64" / "SystemInformer.exe",
-)
+
+
+def get_default_exe_candidates() -> tuple[Path, ...]:
+    """Return default Process Hacker and System Informer candidate paths in priority order."""
+    tools_dir = get_tools_dir()
+    return (
+        Path.home() / "ProcessHacker" / "x64" / "ProcessHacker.exe",
+        Path.home() / "SystemInformer" / "amd64" / "SystemInformer.exe",
+        Path.home() / "SystemInformer" / "x64" / "SystemInformer.exe",
+        tools_dir / "process-hacker" / "x64" / "ProcessHacker.exe",
+        tools_dir / "system-informer" / "amd64" / "SystemInformer.exe",
+        tools_dir / "system-informer" / "x64" / "SystemInformer.exe",
+        tools_dir / "system-informer" / "SystemInformer.exe",
+    )
+
+
+DEFAULT_EXE_CANDIDATES = get_default_exe_candidates()
 
 
 def detect_default_exe() -> str:

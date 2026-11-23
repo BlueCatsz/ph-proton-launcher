@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import hashlib
+import io
+import json
 import os
 import subprocess
 import sys
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 from unittest import mock
 
@@ -22,11 +26,23 @@ from ph_proton_launcher.config import (
     load_config,
     save_config,
 )
+from ph_proton_launcher.downloader import (
+    PROCESS_HACKER_239_SHA256,
+    TOOL_PROCESS_HACKER,
+    TOOL_SYSTEM_INFORMER,
+    DownloadResult,
+    _safe_extract_zip,
+    _validate_download_url,
+    download_and_install_tool,
+    find_executable_in_dir,
+    select_system_informer_asset,
+)
 from ph_proton_launcher.launcher import (
     FLATPAK_PROTONTRICKS_APP_ID,
     build_launch_command,
     resolve_protontricks_command,
     run_auto_launch,
+    tool_display_name,
     validate_launch_inputs,
 )
 from ph_proton_launcher.steam import (
@@ -41,11 +57,45 @@ from ph_proton_launcher.steam import (
 from ph_proton_launcher.ui import MainWindow, create_qapplication
 
 
+class _FakeHttpResponse:
+    """In-memory urllib response stub for downloader tests."""
+
+    def __init__(
+        self,
+        data: bytes,
+        url: str,
+        headers: dict[str, str] | None = None,
+    ) -> None:
+        self._stream = io.BytesIO(data)
+        self._url = url
+        self.headers = headers or {"Content-Length": str(len(data))}
+
+    def read(self, amt: int = -1) -> bytes:
+        return self._stream.read(amt)
+
+    def geturl(self) -> str:
+        return self._url
+
+    def __enter__(self) -> _FakeHttpResponse:
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        return None
+
+
+def _make_zip_bytes(entries: dict[str, bytes]) -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        for name, content in entries.items():
+            zf.writestr(name, content)
+    return buf.getvalue()
+
+
 class VdfAndSteamTests(unittest.TestCase):
-    def test_default_steam_vdf_paths_includes_flatpak(self) -> None:
-        self.assertTrue(
-            any("com.valvesoftware.Steam" in str(path) for path in DEFAULT_STEAM_VDF_PATHS)
-        )
+    def test_default_steam_vdf_paths_includes_flatpak_and_snap(self) -> None:
+        joined = "\n".join(str(path) for path in DEFAULT_STEAM_VDF_PATHS)
+        self.assertIn("com.valvesoftware.Steam", joined)
+        self.assertIn("/snap/steam/", joined)
 
     def test_parse_vdf_handles_comments_escapes_and_nested_blocks(self) -> None:
         raw = """
@@ -157,10 +207,120 @@ class VdfAndSteamTests(unittest.TestCase):
     def test_extract_appid_ignores_grep_tools(self) -> None:
         self.assertIsNone(extract_appid_from_cmdline(["/usr/bin/pgrep", "-af", "SteamLaunch AppId=123"]))
         self.assertIsNone(extract_appid_from_cmdline(["grep", "SteamLaunch AppId=123"]))
+        self.assertIsNone(extract_appid_from_cmdline(["ag", "SteamLaunch AppId=123"]))
         self.assertEqual(
             extract_appid_from_cmdline(["reaper", "SteamLaunch", "AppId=1091500", "--"]),
             "1091500",
         )
+
+
+class DownloaderTests(unittest.TestCase):
+    def test_validate_download_url_enforces_https_and_allowlist(self) -> None:
+        _validate_download_url("https://github.com/winsiderss/systeminformer/releases/download/v4/a.zip")
+        _validate_download_url("https://release-assets.githubusercontent.com/123")
+        _validate_download_url("https://cfhcable.dl.sourceforge.net/project/processhacker/a.zip")
+
+        with self.assertRaises(ValueError):
+            _validate_download_url("http://github.com/file.zip")
+        with self.assertRaises(ValueError):
+            _validate_download_url("https://evil.example.com/file.zip")
+
+    def test_safe_extract_zip_blocks_zip_slip_and_extracts_valid_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            evil_zip = root / "evil.zip"
+            evil_zip.write_bytes(_make_zip_bytes({"../escape.txt": b"bad"}))
+            with self.assertRaises(ValueError):
+                _safe_extract_zip(evil_zip, root / "out")
+
+            abs_zip = root / "abs.zip"
+            abs_zip.write_bytes(_make_zip_bytes({"/tmp/abs.txt": b"bad"}))
+            with self.assertRaises(ValueError):
+                _safe_extract_zip(abs_zip, root / "out2")
+
+            good_zip = root / "good.zip"
+            good_zip.write_bytes(
+                _make_zip_bytes({"x64/ProcessHacker.exe": b"MZ", "x86/ProcessHacker.exe": b"MZ32"})
+            )
+            out_dir = root / "good_out"
+            _safe_extract_zip(good_zip, out_dir)
+            exe = find_executable_in_dir(out_dir, "ProcessHacker.exe")
+            self.assertEqual(exe, out_dir / "x64" / "ProcessHacker.exe")
+
+    def test_select_system_informer_asset_prefers_64bit_and_extracts_digest(self) -> None:
+        payload = {
+            "tag_name": "v4.0.26241.138",
+            "assets": [
+                {
+                    "name": "systeminformer-4.0.26241.138-release-setup.exe",
+                    "browser_download_url": "https://github.com/winsiderss/systeminformer/releases/download/v4/setup.exe",
+                },
+                {
+                    "name": "systeminformer-4.0.26241.138-bin.zip",
+                    "browser_download_url": "https://github.com/winsiderss/systeminformer/releases/download/v4/bin.zip",
+                    "digest": "sha256:" + ("a" * 64),
+                },
+            ],
+        }
+        asset = select_system_informer_asset(payload)
+        self.assertEqual(asset.version, "v4.0.26241.138")
+        self.assertEqual(asset.exe_name, "SystemInformer.exe")
+        self.assertEqual(asset.expected_sha256, "a" * 64)
+
+    def test_download_and_install_tool_verifies_sha256_and_sets_portable_mode(self) -> None:
+        si_zip = _make_zip_bytes(
+            {
+                "amd64/SystemInformer.exe": b"MZ-64",
+                "x86/SystemInformer.exe": b"MZ-32",
+            }
+        )
+        si_sha = hashlib.sha256(si_zip).hexdigest()
+        release_json = json.dumps(
+            {
+                "tag_name": "v4.0.999",
+                "assets": [
+                    {
+                        "name": "systeminformer-bin.zip",
+                        "browser_download_url": "https://github.com/winsiderss/systeminformer/releases/download/v4.0.999/systeminformer-bin.zip",
+                        "digest": f"sha256:{si_sha}",
+                    }
+                ],
+            }
+        ).encode("utf-8")
+
+        def fake_opener(req, timeout=20):  # noqa: ARG001
+            url = req.full_url
+            if "api.github.com" in url:
+                return _FakeHttpResponse(release_json, url)
+            return _FakeHttpResponse(si_zip, url)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tools_dir = Path(tmp) / "tools"
+            progress_events: list[tuple[int, int]] = []
+            result = download_and_install_tool(
+                TOOL_SYSTEM_INFORMER,
+                tools_dir=tools_dir,
+                progress_callback=lambda done, total: progress_events.append((done, total)),
+                opener=fake_opener,
+            )
+            self.assertEqual(result.exe_path, tools_dir / TOOL_SYSTEM_INFORMER / "amd64" / "SystemInformer.exe")
+            self.assertTrue(result.exe_path.is_file())
+            self.assertTrue((result.exe_path.parent / "SystemInformer.exe.settings.xml").is_file())
+            self.assertEqual(result.sha256, si_sha)
+            self.assertTrue(progress_events)
+
+            # Corrupt SHA-256 fails for Process Hacker 2.39
+            bad_ph_zip = _make_zip_bytes({"x64/ProcessHacker.exe": b"BAD"})
+            self.assertNotEqual(hashlib.sha256(bad_ph_zip).hexdigest(), PROCESS_HACKER_239_SHA256)
+            with self.assertRaises(ValueError):
+                download_and_install_tool(
+                    TOOL_PROCESS_HACKER,
+                    tools_dir=tools_dir,
+                    opener=lambda req, timeout=20: _FakeHttpResponse(
+                        bad_ph_zip,
+                        "https://cfhcable.dl.sourceforge.net/project/processhacker/processhacker-2.39-bin.zip",
+                    ),
+                )
 
 
 class ConfigAndLauncherTests(unittest.TestCase):
@@ -222,6 +382,38 @@ class ConfigAndLauncherTests(unittest.TestCase):
 
         with mock.patch("ph_proton_launcher.launcher.shutil.which", return_value=None):
             self.assertIsNone(resolve_protontricks_command())
+
+    def test_tool_display_name_and_flatpak_filesystem_injection(self) -> None:
+        self.assertEqual(tool_display_name("/tmp/ProcessHacker.exe"), "Process Hacker")
+        self.assertEqual(tool_display_name("/tmp/SystemInformer.exe"), "System Informer")
+        self.assertEqual(tool_display_name("/tmp/MyTool.exe"), "MyTool")
+
+        cmd = build_launch_command(
+            "230410",
+            "/tmp/tools/SystemInformer.exe",
+            verbose=True,
+            launcher_prefix=[
+                "flatpak",
+                "run",
+                "--command=protontricks-launch",
+                FLATPAK_PROTONTRICKS_APP_ID,
+            ],
+        )
+        self.assertEqual(
+            cmd,
+            [
+                "flatpak",
+                "run",
+                "--filesystem=/tmp/tools",
+                "--command=protontricks-launch",
+                FLATPAK_PROTONTRICKS_APP_ID,
+                "-v",
+                "--no-bwrap",
+                "--appid",
+                "230410",
+                "/tmp/tools/SystemInformer.exe",
+            ],
+        )
 
     def test_build_command_verbose_and_validation(self) -> None:
         cmd = build_launch_command("230410", "~/ProcessHacker/x64/ProcessHacker.exe")
@@ -322,7 +514,6 @@ class ConfigAndLauncherTests(unittest.TestCase):
                 self.assertEqual(len(errors), 1)
                 self.assertIn("wine failed", errors[0][2])
 
-                # Long-running session terminated when game exits: suppress modal error
                 errors.clear()
                 long_clock = mock.Mock(side_effect=[100.0, 145.0])
                 teardown_runner = mock.Mock(
@@ -339,7 +530,6 @@ class ConfigAndLauncherTests(unittest.TestCase):
                 self.assertEqual(rc_teardown, 0)
                 self.assertEqual(errors, [])
 
-                # Long-running session with actual Protontricks traceback still alerts
                 tb_clock = mock.Mock(side_effect=[100.0, 145.0])
                 tb_runner = mock.Mock(
                     return_value=subprocess.CompletedProcess(
@@ -390,6 +580,35 @@ class ConfigAndLauncherTests(unittest.TestCase):
             mock_auto.assert_called_once()
             mock_gui.assert_not_called()
 
+    def test_cli_download_saves_installed_exe_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_exe = Path(tmp) / "ProcessHacker.exe"
+            fake_result = DownloadResult(
+                tool_key=TOOL_PROCESS_HACKER,
+                display_name="Process Hacker",
+                version="2.39",
+                exe_path=fake_exe,
+                install_dir=Path(tmp),
+                sha256="0" * 64,
+            )
+            cfg = AppConfig()
+            with (
+                mock.patch("ph_proton_launcher.__main__.load_config", return_value=cfg),
+                mock.patch(
+                    "ph_proton_launcher.__main__.download_and_install_tool",
+                    return_value=fake_result,
+                ) as mock_dl,
+                mock.patch(
+                    "ph_proton_launcher.__main__.save_config",
+                    return_value=Path(tmp) / "config.json",
+                ) as mock_save,
+            ):
+                rc = cli_main.main(["--download", TOOL_PROCESS_HACKER])
+                self.assertEqual(rc, 0)
+                mock_dl.assert_called_once_with(TOOL_PROCESS_HACKER)
+                mock_save.assert_called_once()
+                self.assertEqual(cfg.process_hacker_exe, str(fake_exe))
+
 
 class HeadlessGuiTests(unittest.TestCase):
     @classmethod
@@ -397,7 +616,7 @@ class HeadlessGuiTests(unittest.TestCase):
         os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
         cls.app = create_qapplication([])
 
-    def test_verbose_drawer_and_selection_behavior(self) -> None:
+    def test_verbose_drawer_and_selection_preservation(self) -> None:
         games = [SteamGame("620", "Portal 2"), SteamGame("230410", "Warframe")]
         with tempfile.TemporaryDirectory() as tmp:
             cfg_path = Path(tmp) / "config.json"
@@ -408,7 +627,14 @@ class HeadlessGuiTests(unittest.TestCase):
                 initial_games=games,
             )
             self.assertTrue(win.log_container.isHidden())
+            self.assertTrue(win.stop_button.isHidden())
             self.assertEqual(win.selected_appid(), "620")
+
+            # Selecting second game and refreshing keeps AppID 230410 selected
+            win.games_list.setCurrentRow(1)
+            self.assertEqual(win.selected_appid(), "230410")
+            win.refresh_games(games=[SteamGame("570", "Dota 2"), SteamGame("230410", "Warframe")])
+            self.assertEqual(win.selected_appid(), "230410")
 
             win.manual_appid_input.setText("999999")
             win._on_manual_appid_edited("999999")
@@ -460,7 +686,7 @@ class HeadlessGuiTests(unittest.TestCase):
 
             win.deleteLater()
 
-    def test_qprocess_streams_stdout_and_stderr_live(self) -> None:
+    def test_qprocess_streams_stdout_and_stderr_live_and_toggles_stop_button(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             cfg_path = Path(tmp) / "config.json"
             win = MainWindow(
@@ -469,6 +695,8 @@ class HeadlessGuiTests(unittest.TestCase):
                 start_verbose=True,
                 initial_games=[],
             )
+            self.assertTrue(win.stop_button.isHidden())
+
             loop = QEventLoop()
             win.process.finished.connect(lambda _code, _status: loop.quit())
             QTimer.singleShot(5000, loop.quit)
@@ -481,9 +709,11 @@ class HeadlessGuiTests(unittest.TestCase):
                 ],
                 target_label="Test Stream",
             )
+            self.assertFalse(win.stop_button.isHidden())
             loop.exec()
             QApplication.processEvents()
 
+            self.assertTrue(win.stop_button.isHidden())
             log_text = win.log_view.toPlainText()
             self.assertIn("stdout line", log_text)
             self.assertIn("stderr line", log_text)

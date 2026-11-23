@@ -20,9 +20,18 @@ DEFAULT_STEAM_VDF_PATHS = (
     / "Steam"
     / "steamapps"
     / "libraryfolders.vdf",
+    Path.home()
+    / "snap"
+    / "steam"
+    / "common"
+    / ".local"
+    / "share"
+    / "Steam"
+    / "steamapps"
+    / "libraryfolders.vdf",
 )
 
-_IGNORED_SCAN_EXECUTABLES = frozenset({"pgrep", "grep", "rg"})
+_IGNORED_SCAN_EXECUTABLES = frozenset({"pgrep", "grep", "rg", "ag"})
 _APPID_TOKEN_RE = re.compile(r"AppId=(\d+)")
 _SHELL_STEAMLAUNCH_RE = re.compile(r"\bSteamLaunch\s+AppId=(\d+)\b")
 

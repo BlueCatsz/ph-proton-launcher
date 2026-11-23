@@ -50,6 +50,17 @@ def resolve_protontricks_command() -> list[str] | None:
     return None
 
 
+def tool_display_name(exe_path: str | Path) -> str:
+    """Return a clean human-readable tool label for the configured executable."""
+    path = Path(str(exe_path).strip()) if str(exe_path).strip() else Path("ProcessHacker.exe")
+    lower_name = path.name.casefold()
+    if lower_name == "processhacker.exe":
+        return "Process Hacker"
+    if lower_name == "systeminformer.exe":
+        return "System Informer"
+    return path.stem or "Process Hacker"
+
+
 def build_launch_command(
     appid: str,
     exe_path: str | Path,
@@ -62,17 +73,28 @@ def build_launch_command(
     if not clean_appid.isdigit():
         raise ValueError(f"AppID must be numeric, got {appid!r}")
 
+    resolved_exe = Path(exe_path).expanduser()
     prefix = list(launcher_prefix) if launcher_prefix else ["protontricks-launch"]
+
+    # Automatically expose the executable directory to Flatpak Protontricks.
+    if len(prefix) >= 2 and prefix[0] == "flatpak" and prefix[1] == "run":
+        fs_arg = f"--filesystem={resolved_exe.parent}"
+        if fs_arg not in prefix:
+            cmd_idx = next(
+                (idx for idx, tok in enumerate(prefix) if tok.startswith("--command=")),
+                len(prefix),
+            )
+            prefix.insert(cmd_idx, fs_arg)
+
     if verbose:
         prefix.append("-v")
 
-    resolved_exe = str(Path(exe_path).expanduser())
     return [
         *prefix,
         "--no-bwrap",
         "--appid",
         clean_appid,
-        resolved_exe,
+        str(resolved_exe),
     ]
 
 
@@ -177,19 +199,20 @@ def run_auto_launch(
     clock: Callable[[], float] = time.monotonic,
     long_run_threshold: float = AUTO_LONG_RUN_THRESHOLD_SECONDS,
 ) -> int:
-    """Silently launch Process Hacker for ``game`` in ``--auto`` mode."""
+    """Silently launch the configured tool for ``game`` in ``--auto`` mode."""
+    tool_name = tool_display_name(config.process_hacker_exe)
     error_msg, cmd = validate_launch_inputs(game.appid, config.process_hacker_exe)
     if error_msg or cmd is None:
         if error_presenter is not None:
             error_presenter(
-                "Process Hacker Launch Failed",
+                f"{tool_name} Launch Failed",
                 error_msg or "Invalid launch configuration.",
                 "",
             )
         return 1
 
     notifier(
-        "Launching Process Hacker",
+        f"Launching {tool_name}",
         f"Attaching to {game.display_label}",
     )
 
@@ -205,7 +228,7 @@ def run_auto_launch(
     except OSError as exc:
         if error_presenter is not None:
             error_presenter(
-                "Process Hacker Launch Failed",
+                f"{tool_name} Launch Failed",
                 f"Failed to execute protontricks-launch for {game.display_label}.",
                 str(exc),
             )
@@ -226,7 +249,7 @@ def run_auto_launch(
 
     if error_presenter is not None:
         error_presenter(
-            "Process Hacker Launch Failed",
+            f"{tool_name} Launch Failed",
             (
                 f"protontricks-launch exited with code {result.returncode} "
                 f"for {game.display_label}."
