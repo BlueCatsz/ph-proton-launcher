@@ -164,7 +164,7 @@ class MainWindow(QMainWindow):
         self.process.errorOccurred.connect(self._on_process_error)
         self.process.finished.connect(self._on_process_finished)
 
-        self.setWindowTitle("Process Hacker Proton Launcher")
+        self.setWindowTitle(APP_NAME)
         icon = QIcon.fromTheme(_ICON_NAME)
         if not icon.isNull():
             self.setWindowIcon(icon)

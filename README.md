@@ -4,6 +4,8 @@
 
 A lightweight PyQt6 Linux desktop utility (Wayland & X11, native KDE Plasma integration) for launching **Process Hacker**, **System Informer**, or any custom Windows `.exe` directly inside a running Steam Proton prefix via `protontricks-launch`.
 
+![Process Hacker Proton Launcher UI](docs/screenshot.png)
+
 ## What Is This?
 
 On Linux, Steam runs Windows games inside isolated Proton/Wine prefixes. If you want to attach **Process Hacker** or **System Informer** to a running game (to inspect threads, modules, memory, or handles inside that prefix), you normally have to find the game's Steam AppID and manually run:
@@ -25,6 +27,10 @@ protontricks-launch --no-bwrap --appid <APPID> /path/to/ProcessHacker.exe
 - **Compact Native Qt6 UI:** Lists running games as `Game Name (AppID)` (preserving your selection across **Refresh** / `F5`), double-click launch, manual numeric AppID fallback, an editable executable path picker, and a **Stop** button when a launch is active.
 - **Live Collapsible Verbose Log:** Toggleable monospace log drawer powered by `QProcess` that streams `stdout`/`stderr` live inside the window and passes `-v` to `protontricks-launch` (no external terminal window spawned).
 - **Native & Flatpak Protontricks Support:** Uses `protontricks-launch` from `PATH`, automatically falling back to `flatpak run --command=protontricks-launch com.github.Matoking.protontricks` and passing `--filesystem=<tool_dir>` so Flatpak Protontricks can read your executable without extra manual overrides.
+
+## Intended Use & Anti-Cheat Note
+
+This tool is intended for **debugging, inspecting Proton/Wine threads, loaded DLLs, handles, troubleshooting hung games, and offline/single-player modding**. Do **not** attach Process Hacker or System Informer to online/multiplayer games protected by anti-cheat systems.
 
 ---
 
@@ -118,6 +124,10 @@ QT_QPA_PLATFORM=offscreen PYTHONPATH=. python3 -m unittest discover -s tests -v
 ```
 
 Removes `~/.local/share/ph-proton-launcher/` and `~/.local/share/applications/ph-proton-launcher.desktop` while preserving your saved config.
+
+## AI Assistance Disclaimer
+
+This project was designed, written, and reviewed with AI assistance, then verified with automated unit/headless Qt tests and live testing on Linux (KDE Plasma 6 Wayland). Because the codebase is small and dependency-light (pure Python standard library + PyQt6), you are encouraged to read through the source files before running them—issues, code reviews, and pull requests are welcome.
 
 ## License
 
