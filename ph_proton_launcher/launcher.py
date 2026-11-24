@@ -193,6 +193,94 @@ def _combine_process_output(stdout: str | None, stderr: str | None) -> str:
     return "\n\n".join(parts)
 
 
+def read_proc_children_map(proc_root: Path = Path("/proc")) -> dict[int, list[int]]:
+    """Build a ``ppid -> [child_pid, ...]`` mapping from ``proc_root``."""
+    children: dict[int, list[int]] = {}
+    try:
+        entries = list(proc_root.iterdir())
+    except OSError:
+        return children
+
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        try:
+            stat_text = (entry / "stat").read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+
+        rparen = stat_text.rfind(")")
+        if rparen == -1:
+            continue
+        fields = stat_text[rparen + 1 :].split()
+        if len(fields) < 2:
+            continue
+        try:
+            ppid = int(fields[1])
+        except ValueError:
+            continue
+        children.setdefault(ppid, []).append(pid)
+
+    return children
+
+
+def list_descendant_pids(
+    root_pid: int,
+    proc_root: Path = Path("/proc"),
+) -> tuple[list[int], list[int]]:
+    """Return ``(all_descendants_bottom_up, leaf_descendants)`` for ``root_pid``."""
+    if root_pid <= 0:
+        return ([], [])
+
+    children_map = read_proc_children_map(proc_root)
+    visited: set[int] = {root_pid}
+    bottom_up: list[int] = []
+    leaves: list[int] = []
+
+    def _dfs(pid: int) -> None:
+        direct_children = [
+            child for child in children_map.get(pid, ()) if child not in visited
+        ]
+        for child in direct_children:
+            visited.add(child)
+            _dfs(child)
+            bottom_up.append(child)
+        if pid != root_pid and not direct_children:
+            leaves.append(pid)
+
+    _dfs(root_pid)
+    return (bottom_up, leaves)
+
+
+def signal_process_tree(
+    root_pid: int,
+    sig: int,
+    *,
+    leaves_only: bool = False,
+    proc_root: Path = Path("/proc"),
+    killer: Callable[[int, int], None] = os.kill,
+) -> list[int]:
+    """Send ``sig`` to ``root_pid``'s descendant process tree."""
+    if root_pid <= 0:
+        return []
+
+    descendants, leaves = list_descendant_pids(root_pid, proc_root=proc_root)
+    if leaves_only:
+        targets = leaves if leaves else [root_pid]
+    else:
+        targets = [*descendants, root_pid]
+
+    signaled: list[int] = []
+    for pid in targets:
+        try:
+            killer(pid, sig)
+        except (ProcessLookupError, PermissionError, OSError):
+            continue
+        signaled.append(pid)
+    return signaled
+
+
 def run_auto_launch(
     game: SteamGame,
     config: AppConfig,

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import shlex
+import signal
 import threading
 import time
 from pathlib import Path
@@ -18,6 +19,7 @@ from PyQt6.QtCore import (
 )
 from PyQt6.QtGui import (
     QFontDatabase,
+    QFontMetrics,
     QIcon,
     QKeySequence,
     QRegularExpressionValidator,
@@ -38,6 +40,7 @@ from PyQt6.QtWidgets import (
     QPlainTextEdit,
     QProgressDialog,
     QPushButton,
+    QSizePolicy,
     QVBoxLayout,
     QWidget,
 )
@@ -53,6 +56,7 @@ from .downloader import (
 )
 from .launcher import (
     is_expected_teardown_exit,
+    signal_process_tree,
     tool_display_name,
     validate_launch_inputs,
 )
@@ -96,6 +100,41 @@ def show_error_dialog(
     if details and details.strip():
         box.setDetailedText(details.strip())
     box.exec()
+
+
+class _ElidedLabel(QLabel):
+    """Single-line label that elides long text cleanly instead of wrapping or overflowing."""
+
+    def __init__(self, text: str = "", parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._full_text = text
+        self.setWordWrap(False)
+        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        self.setToolTip(text)
+        self._apply_elided_text()
+
+    def text(self) -> str:  # type: ignore[override]
+        """Return the full, non-elided label text."""
+        return self._full_text
+
+    def setText(self, text: str) -> None:  # type: ignore[override]
+        """Store ``text``, expose it via tooltip, and elide it to fit current width."""
+        self._full_text = text
+        self.setToolTip(text)
+        self._apply_elided_text()
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._apply_elided_text()
+
+    def _apply_elided_text(self) -> None:
+        avail = self.contentsRect().width() if self.isVisible() else max(self.width(), 400)
+        elided = QFontMetrics(self.font()).elidedText(
+            self._full_text,
+            Qt.TextElideMode.ElideRight,
+            max(10, avail),
+        )
+        super().setText(elided)
 
 
 class _DownloadWorker(QObject):
@@ -183,6 +222,7 @@ class MainWindow(QMainWindow):
         root = QVBoxLayout(central)
         root.setContentsMargins(12, 12, 12, 12)
         root.setSpacing(8)
+        self._root_layout = root
 
         # 1. Running Steam Games header
         header_row = QHBoxLayout()
@@ -206,8 +246,11 @@ class MainWindow(QMainWindow):
 
         # 2. Games list
         self.games_list = QListWidget()
-        self.games_list.setMinimumHeight(96)
-        self.games_list.setMaximumHeight(140)
+        self.games_list.setMinimumHeight(88)
+        self.games_list.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Expanding,
+        )
         self.games_list.setAlternatingRowColors(True)
         self.games_list.itemClicked.connect(self._on_game_clicked)
         self.games_list.itemDoubleClicked.connect(self._on_game_double_clicked)
@@ -324,26 +367,43 @@ class MainWindow(QMainWindow):
         log_layout.addWidget(self.log_view)
 
         self.log_container.setVisible(start_verbose)
-        root.addWidget(self.log_container, stretch=1)
+        root.addWidget(self.log_container)
 
         # 7. Status indicator
-        self.status_label = QLabel("Ready.")
-        self.status_label.setWordWrap(True)
+        self.status_label = _ElidedLabel("Ready.")
         root.addWidget(self.status_label)
+
+        self._apply_verbose_layout(start_verbose)
+
+    def _apply_verbose_layout(self, expanded: bool) -> None:
+        if expanded:
+            self.games_list.setMaximumHeight(140)
+            self._root_layout.setStretchFactor(self.games_list, 0)
+            self._root_layout.setStretchFactor(self.log_container, 1)
+        else:
+            self.games_list.setMaximumHeight(16777215)
+            self._root_layout.setStretchFactor(self.games_list, 1)
+            self._root_layout.setStretchFactor(self.log_container, 0)
 
     def _sync_window_size(self) -> None:
         if self.centralWidget():
             self.centralWidget().updateGeometry()
-            if self.centralWidget().layout():
-                self.centralWidget().layout().activate()
-        target_width = max(self.width() if self.isVisible() else 580, 520)
+            self._root_layout.activate()
+        min_h = max(
+            self._root_layout.minimumSize().height(),
+            self.minimumSizeHint().height(),
+        )
+        self.setMinimumHeight(min_h)
+        target_width = max(self.width() if self.isVisible() else 580, 540)
         if self.verbose_checkbox.isChecked():
-            target_height = max(self.sizeHint().height(), 470)
+            target_height = max(self.sizeHint().height(), min_h, 480)
         else:
-            target_height = self.minimumSizeHint().height()
+            target_height = max(min_h, 290)
         self.resize(target_width, target_height)
 
     def _on_verbose_toggled(self, checked: bool) -> None:
+        self.setMinimumHeight(0)
+        self._apply_verbose_layout(checked)
         self.log_container.setVisible(checked)
         QTimer.singleShot(0, self._sync_window_size)
 
@@ -698,16 +758,25 @@ class MainWindow(QMainWindow):
         if self.process.state() == QProcess.ProcessState.NotRunning:
             return
         self._stop_requested = True
+        pid = int(self.process.processId())
         if not self._terminate_sent:
             self._terminate_sent = True
             self.stop_button.setText("Kill")
             self.stop_button.setToolTip("Force-kill the active launcher process")
-            self._append_log_line("[stop] Sent SIGTERM; click Kill to force-terminate.")
+            signaled = signal_process_tree(pid, signal.SIGTERM, leaves_only=True)
+            if not signaled:
+                self.process.terminate()
+            pids_desc = ", ".join(str(p) for p in signaled) if signaled else str(pid)
+            self._append_log_line(
+                f"[stop] Sent SIGTERM to PID(s) {pids_desc}; click Kill to force-terminate."
+            )
             self.status_label.setText(f"Stopping {self._active_tool_name}…")
-            self.process.terminate()
         else:
-            self._append_log_line("[stop] Sent SIGKILL.")
-            self.process.kill()
+            signaled = signal_process_tree(pid, signal.SIGKILL, leaves_only=False)
+            if self.process.state() != QProcess.ProcessState.NotRunning:
+                self.process.kill()
+            pids_desc = ", ".join(str(p) for p in signaled) if signaled else str(pid)
+            self._append_log_line(f"[stop] Sent SIGKILL to PID(s) {pids_desc}.")
 
     def _on_process_started(self) -> None:
         pid = self.process.processId()

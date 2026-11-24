@@ -6,6 +6,7 @@ import hashlib
 import io
 import json
 import os
+import signal
 import subprocess
 import sys
 import tempfile
@@ -42,8 +43,10 @@ from ph_proton_launcher.downloader import (
 from ph_proton_launcher.launcher import (
     FLATPAK_PROTONTRICKS_APP_ID,
     build_launch_command,
+    list_descendant_pids,
     resolve_protontricks_command,
     run_auto_launch,
+    signal_process_tree,
     tool_display_name,
     validate_launch_inputs,
 )
@@ -705,6 +708,54 @@ class ConfigAndLauncherTests(unittest.TestCase):
                 mock_save.assert_called_once()
                 self.assertEqual(cfg.process_hacker_exe, str(fake_exe))
 
+    def test_process_tree_discovery_and_targeted_signaling(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            proc = Path(tmp) / "proc"
+
+            def add_stat(pid: int, comm: str, ppid: int) -> None:
+                pdir = proc / str(pid)
+                pdir.mkdir(parents=True)
+                (pdir / "stat").write_text(
+                    f"{pid} ({comm}) S {ppid} 100 100 0 -1 0 0 0 0 0 0 0 0 20 0 1 0 0 0 0",
+                    encoding="utf-8",
+                )
+
+            # Tree: 100 (protontricks-launch) -> 101 (sh) -> 102 (wine (ProcessHacker))
+            # Unrelated game/wineserver PID 500 must never be touched.
+            add_stat(100, "protontricks-la", 1)
+            add_stat(101, "sh", 100)
+            add_stat(102, "wine (ProcessHacker)", 101)
+            add_stat(500, "wineserver", 1)
+
+            descendants, leaves = list_descendant_pids(100, proc_root=proc)
+            self.assertEqual(descendants, [102, 101])
+            self.assertEqual(leaves, [102])
+
+            term_calls: list[tuple[int, int]] = []
+            signaled_term = signal_process_tree(
+                100,
+                signal.SIGTERM,
+                leaves_only=True,
+                proc_root=proc,
+                killer=lambda p, s: term_calls.append((p, s)),
+            )
+            self.assertEqual(signaled_term, [102])
+            self.assertEqual(term_calls, [(102, signal.SIGTERM)])
+
+            kill_calls: list[tuple[int, int]] = []
+            signaled_kill = signal_process_tree(
+                100,
+                signal.SIGKILL,
+                leaves_only=False,
+                proc_root=proc,
+                killer=lambda p, s: kill_calls.append((p, s)),
+            )
+            self.assertEqual(signaled_kill, [102, 101, 100])
+            self.assertEqual(
+                kill_calls,
+                [(102, signal.SIGKILL), (101, signal.SIGKILL), (100, signal.SIGKILL)],
+            )
+
 
 class HeadlessGuiTests(unittest.TestCase):
     @classmethod
@@ -862,6 +913,84 @@ class HeadlessGuiTests(unittest.TestCase):
             win._close_progress_dialog()
             QApplication.processEvents()
             self.assertEqual(cancel_calls, [])
+
+            win.deleteLater()
+
+    def test_resize_never_overlaps_widgets_and_stop_terminates_child_tree(self) -> None:
+        games = [SteamGame("311210", "Call of Duty: Black Ops III")]
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg_path = Path(tmp) / "config.json"
+            win = MainWindow(
+                config=AppConfig(),
+                config_path=cfg_path,
+                start_verbose=False,
+                initial_games=games,
+            )
+            win.status_label.setText(
+                "Running Process Hacker for Call of Duty: Black Ops III (311210) (PID 20651)…"
+            )
+            win.show()
+
+            for expanded in (False, True):
+                win.verbose_checkbox.setChecked(expanded)
+                QApplication.processEvents()
+                win._sync_window_size()
+                QApplication.processEvents()
+
+                for target_h in (win.minimumHeight(), 340 if not expanded else 500, 620):
+                    win.resize(520, max(win.minimumHeight(), target_h))
+                    QApplication.processEvents()
+                    self.assertLess(
+                        win.games_list.geometry().bottom(),
+                        win.manual_appid_input.geometry().top(),
+                    )
+                    self.assertLess(
+                        win.manual_appid_input.geometry().bottom(),
+                        win.exe_path_input.geometry().top(),
+                    )
+
+            # Real 2-level child process: sh -> python sleep; Stop must terminate child leaf.
+            pid_file = Path(tmp) / "child.pid"
+            child_script = (
+                f"import pathlib, os, time; "
+                f"pathlib.Path({str(pid_file)!r}).write_text(str(os.getpid())); "
+                f"time.sleep(30)"
+            )
+            started_loop = QEventLoop()
+            finished_loop = QEventLoop()
+            win.process.started.connect(started_loop.quit)
+            win.process.finished.connect(lambda _code, _status: finished_loop.quit())
+            QTimer.singleShot(5000, started_loop.quit)
+            QTimer.singleShot(5000, finished_loop.quit)
+
+            with mock.patch("ph_proton_launcher.ui.show_error_dialog") as mock_err:
+                win.start_command(
+                    "/bin/sh",
+                    ["-c", f"{sys.executable} -c {child_script!r}; true"],
+                    target_label="Child Tree",
+                )
+                started_loop.exec()
+
+                # Wait briefly for grandchild python process to write pid_file
+                for _ in range(50):
+                    if pid_file.is_file() and pid_file.read_text().strip():
+                        break
+                    QApplication.processEvents()
+                    QTimer.singleShot(20, lambda: None)
+                    import time as _time
+
+                    _time.sleep(0.02)
+
+                self.assertTrue(pid_file.is_file())
+                child_pid = int(pid_file.read_text().strip())
+
+                win.stop_button.click()
+                finished_loop.exec()
+                QApplication.processEvents()
+
+                mock_err.assert_not_called()
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(child_pid, 0)
 
             win.deleteLater()
 
