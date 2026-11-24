@@ -148,6 +148,8 @@ class MainWindow(QMainWindow):
         self._output_size = 0
         self._last_error_handled = False
         self._quit_on_finish = False
+        self._stop_requested = False
+        self._terminate_sent = False
         self._active_target_label = ""
         self._active_tool_name = tool_display_name(config.process_hacker_exe)
         self._process_started_at: float | None = None
@@ -254,9 +256,9 @@ class MainWindow(QMainWindow):
         act_ph = download_menu.addAction(
             "Process Hacker 2.39 (Classic — recommended for Proton)"
         )
-        act_ph.triggered.connect(lambda: self.start_download(TOOL_PROCESS_HACKER))
+        act_ph.triggered.connect(lambda _checked=False: self.start_download(TOOL_PROCESS_HACKER))
         act_si = download_menu.addAction("System Informer (Latest Stable)")
-        act_si.triggered.connect(lambda: self.start_download(TOOL_SYSTEM_INFORMER))
+        act_si.triggered.connect(lambda _checked=False: self.start_download(TOOL_SYSTEM_INFORMER))
         self.download_button.setMenu(download_menu)
 
         exe_row.addWidget(exe_label)
@@ -374,11 +376,13 @@ class MainWindow(QMainWindow):
     def _set_running_state(self, running: bool) -> None:
         self.launch_button.setEnabled(not running)
         self.launch_button.setText("Running…" if running else "Launch")
+        self.stop_button.setText("Stop")
+        self.stop_button.setToolTip("Terminate the active launcher process")
         self.stop_button.setVisible(running)
 
-    def _persist_exe_path(self) -> None:
+    def _persist_exe_path(self, *, force: bool = False) -> None:
         text = self.exe_path_input.text().strip()
-        if not text or text == self._config.process_hacker_exe:
+        if not text or (not force and text == self._config.process_hacker_exe):
             return
         self._config.process_hacker_exe = text
         try:
@@ -399,7 +403,7 @@ class MainWindow(QMainWindow):
         )
         if selected:
             self.exe_path_input.setText(selected)
-            self._persist_exe_path()
+            self._persist_exe_path(force=True)
 
     def start_download(self, tool_key: str) -> None:
         """Download and install a portable Process Hacker or System Informer build."""
@@ -459,6 +463,7 @@ class MainWindow(QMainWindow):
 
     def _close_progress_dialog(self) -> None:
         if self._progress_dialog is not None:
+            self._progress_dialog.blockSignals(True)
             self._progress_dialog.close()
             self._progress_dialog.deleteLater()
             self._progress_dialog = None
@@ -485,7 +490,7 @@ class MainWindow(QMainWindow):
     def _on_download_finished(self, result: DownloadResult) -> None:
         self._close_progress_dialog()
         self.exe_path_input.setText(str(result.exe_path))
-        self._persist_exe_path()
+        self._persist_exe_path(force=True)
         self.status_label.setText(
             f"Installed {result.display_name} ({result.version}) to {result.exe_path}."
         )
@@ -640,6 +645,8 @@ class MainWindow(QMainWindow):
         self._output_chunks.clear()
         self._output_size = 0
         self._last_error_handled = False
+        self._stop_requested = False
+        self._terminate_sent = False
         self._active_target_label = target_label or program
         self._active_tool_name = tool_name or tool_display_name(
             self.exe_path_input.text().strip()
@@ -690,9 +697,17 @@ class MainWindow(QMainWindow):
     def _on_stop_clicked(self) -> None:
         if self.process.state() == QProcess.ProcessState.NotRunning:
             return
-        self._append_log_line("[stop] Requested process termination.")
-        self.status_label.setText(f"Stopping {self._active_tool_name}…")
-        self.process.terminate()
+        self._stop_requested = True
+        if not self._terminate_sent:
+            self._terminate_sent = True
+            self.stop_button.setText("Kill")
+            self.stop_button.setToolTip("Force-kill the active launcher process")
+            self._append_log_line("[stop] Sent SIGTERM; click Kill to force-terminate.")
+            self.status_label.setText(f"Stopping {self._active_tool_name}…")
+            self.process.terminate()
+        else:
+            self._append_log_line("[stop] Sent SIGKILL.")
+            self.process.kill()
 
     def _on_process_started(self) -> None:
         pid = self.process.processId()
@@ -726,6 +741,9 @@ class MainWindow(QMainWindow):
         self, exit_code: int, exit_status: QProcess.ExitStatus
     ) -> None:
         self._on_process_output()
+        was_stopped = self._stop_requested
+        self._stop_requested = False
+        self._terminate_sent = False
         self._set_running_state(False)
 
         elapsed = (
@@ -740,7 +758,9 @@ class MainWindow(QMainWindow):
         self._append_log_line(f"[finished] exit code {exit_code} ({status_name})")
 
         details = self._collected_output()
-        if exit_code == 0 and not crashed:
+        if was_stopped:
+            self.status_label.setText(f"Stopped {self._active_tool_name}.")
+        elif exit_code == 0 and not crashed:
             self.status_label.setText(
                 f"{self._active_tool_name} exited cleanly (code 0)."
             )

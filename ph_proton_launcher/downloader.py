@@ -34,6 +34,7 @@ SYSTEM_INFORMER_FALLBACK_API = (
 )
 
 MAX_DOWNLOAD_BYTES = 100 * 1024 * 1024  # 100 MiB
+MAX_EXTRACTED_BYTES = 250 * 1024 * 1024  # 250 MiB
 _CHUNK_SIZE = 65536
 _USER_AGENT = "ph-proton-launcher/1.0"
 _ALLOWED_HOSTS = frozenset(
@@ -46,6 +47,18 @@ _ALLOWED_HOSTS = frozenset(
         "downloads.sourceforge.net",
     }
 )
+
+
+class _TrustedRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Reject HTTP redirects to insecure schemes or untrusted hosts before connecting."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        resolved = urllib.parse.urljoin(req.full_url, newurl)
+        _validate_download_url(resolved)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_default_opener = urllib.request.build_opener(_TrustedRedirectHandler)
 
 
 class DownloadCancelledError(RuntimeError):
@@ -167,7 +180,7 @@ def _fetch_json(url: str, *, opener: Callable[..., Any]) -> dict[str, Any]:
 def resolve_release_asset(
     tool_key: str,
     *,
-    opener: Callable[..., Any] = urllib.request.urlopen,
+    opener: Callable[..., Any] = _default_opener.open,
 ) -> ReleaseAsset:
     """Resolve download URL, version, and checksum metadata for ``tool_key``."""
     if tool_key == TOOL_PROCESS_HACKER:
@@ -197,9 +210,15 @@ def resolve_release_asset(
     raise ValueError(f"Unsupported tool key: {tool_key!r}")
 
 
-def _safe_extract_zip(zip_path: Path, dest_dir: Path) -> None:
+def _safe_extract_zip(
+    zip_path: Path,
+    dest_dir: Path,
+    *,
+    max_extracted_bytes: int = MAX_EXTRACTED_BYTES,
+) -> None:
     """Safely extract regular files and directories from ``zip_path`` into ``dest_dir``."""
     dest_root = dest_dir.resolve()
+    extracted_total = 0
     with zipfile.ZipFile(zip_path, "r") as zf:
         for info in zf.infolist():
             member_name = info.filename.replace("\\", "/")
@@ -229,7 +248,16 @@ def _safe_extract_zip(zip_path: Path, dest_dir: Path) -> None:
 
             target.parent.mkdir(parents=True, exist_ok=True)
             with zf.open(info, "r") as src, target.open("wb") as dst:
-                shutil.copyfileobj(src, dst, length=_CHUNK_SIZE)
+                while True:
+                    chunk = src.read(_CHUNK_SIZE)
+                    if not chunk:
+                        break
+                    extracted_total += len(chunk)
+                    if extracted_total > max_extracted_bytes:
+                        raise ValueError(
+                            f"Extracted archive contents exceed {max_extracted_bytes} byte limit."
+                        )
+                    dst.write(chunk)
 
 
 def find_executable_in_dir(root_dir: Path, exe_name: str) -> Path:
@@ -266,7 +294,7 @@ def download_and_install_tool(
     tools_dir: Path | None = None,
     progress_callback: Callable[[int, int], None] | None = None,
     cancel_check: Callable[[], bool] | None = None,
-    opener: Callable[..., Any] = urllib.request.urlopen,
+    opener: Callable[..., Any] = _default_opener.open,
 ) -> DownloadResult:
     """Download, SHA-256 verify, safely extract, and atomically install a portable tool."""
     asset = resolve_release_asset(tool_key, opener=opener)

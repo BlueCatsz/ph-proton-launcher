@@ -13,6 +13,11 @@ if ! SYSTEM_PYTHON="$(command -v python3)"; then
     exit 1
 fi
 
+if ! "$SYSTEM_PYTHON" -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)"; then
+    echo "Error: Python 3.10 or newer is required (found $("$SYSTEM_PYTHON" --version 2>&1))." >&2
+    exit 1
+fi
+
 echo "Installing Process Hacker Proton Launcher to $INSTALL_DIR..."
 
 rm -rf "$INSTALL_DIR/ph_proton_launcher"

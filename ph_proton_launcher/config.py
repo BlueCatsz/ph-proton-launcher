@@ -38,12 +38,18 @@ def get_default_exe_candidates() -> tuple[Path, ...]:
     )
 
 
-DEFAULT_EXE_CANDIDATES = get_default_exe_candidates()
+_INITIAL_DEFAULT_EXE_CANDIDATES = get_default_exe_candidates()
+DEFAULT_EXE_CANDIDATES = _INITIAL_DEFAULT_EXE_CANDIDATES
 
 
 def detect_default_exe() -> str:
     """Return the first existing default Process Hacker / System Informer executable."""
-    for candidate in DEFAULT_EXE_CANDIDATES:
+    candidates = (
+        get_default_exe_candidates()
+        if DEFAULT_EXE_CANDIDATES is _INITIAL_DEFAULT_EXE_CANDIDATES
+        else DEFAULT_EXE_CANDIDATES
+    )
+    for candidate in candidates:
         if candidate.is_file():
             return str(candidate)
     return DEFAULT_PROCESS_HACKER_EXE

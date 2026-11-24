@@ -166,19 +166,16 @@ def _normalize_path_no_fs(path_str: str | Path) -> Path:
     return Path(os.path.normpath(str(expanded)))
 
 
-def _resolve_vdf_path(vdf_path: Path | None) -> Path:
-    """Pick the active ``libraryfolders.vdf`` path."""
+def _resolve_vdf_paths(vdf_path: Path | None) -> list[Path]:
+    """Return active ``libraryfolders.vdf`` paths to inspect in priority order."""
     if vdf_path is not None:
-        return vdf_path
-    for candidate in DEFAULT_STEAM_VDF_PATHS:
-        if candidate.is_file():
-            return candidate
-    return DEFAULT_STEAM_VDF_PATHS[0]
+        return [vdf_path]
+    existing = [candidate for candidate in DEFAULT_STEAM_VDF_PATHS if candidate.is_file()]
+    return existing if existing else [DEFAULT_STEAM_VDF_PATHS[0]]
 
 
 def get_steam_libraries(vdf_path: Path | None = None) -> list[tuple[Path, set[str]]]:
     """Return ordered, deduplicated ``(library_path, known_appids)`` pairs."""
-    target_vdf = _resolve_vdf_path(vdf_path)
     libraries: dict[Path, set[str]] = {}
 
     def add_library(raw_path: str | Path, appids: set[str] | None = None) -> None:
@@ -187,38 +184,39 @@ def get_steam_libraries(vdf_path: Path | None = None) -> list[tuple[Path, set[st
         if appids:
             bucket.update(appids)
 
-    try:
-        vdf_text = target_vdf.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        vdf_text = ""
+    for target_vdf in _resolve_vdf_paths(vdf_path):
+        try:
+            vdf_text = target_vdf.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            vdf_text = ""
 
-    if vdf_text:
-        parsed = parse_vdf(vdf_text)
-        folders = _ci_get(parsed, "libraryfolders")
-        if not isinstance(folders, dict):
-            folders = parsed
+        if vdf_text:
+            parsed = parse_vdf(vdf_text)
+            folders = _ci_get(parsed, "libraryfolders")
+            if not isinstance(folders, dict):
+                folders = parsed
 
-        for key, entry in folders.items():
-            if isinstance(entry, dict):
-                raw_path = _ci_get(entry, "path")
-                if not isinstance(raw_path, str) or not raw_path.strip():
-                    continue
-                apps_obj = _ci_get(entry, "apps")
-                appids: set[str] = set()
-                if isinstance(apps_obj, dict):
-                    appids = {
-                        str(app_key).strip()
-                        for app_key in apps_obj
-                        if str(app_key).strip().isdigit()
-                    }
-                add_library(raw_path.strip(), appids)
-            elif isinstance(entry, str) and str(key).strip().isdigit() and entry.strip():
-                add_library(entry.strip())
+            for key, entry in folders.items():
+                if isinstance(entry, dict):
+                    raw_path = _ci_get(entry, "path")
+                    if not isinstance(raw_path, str) or not raw_path.strip():
+                        continue
+                    apps_obj = _ci_get(entry, "apps")
+                    appids: set[str] = set()
+                    if isinstance(apps_obj, dict):
+                        appids = {
+                            str(app_key).strip()
+                            for app_key in apps_obj
+                            if str(app_key).strip().isdigit()
+                        }
+                    add_library(raw_path.strip(), appids)
+                elif isinstance(entry, str) and str(key).strip().isdigit() and entry.strip():
+                    add_library(entry.strip())
 
-    # Always include the Steam root owning libraryfolders.vdf as a fallback library.
-    vdf_root = target_vdf.parent.parent
-    if str(vdf_root) not in ("", "."):
-        add_library(vdf_root)
+        # Always include the Steam root owning libraryfolders.vdf as a fallback library.
+        vdf_root = target_vdf.parent.parent
+        if str(vdf_root) not in ("", "."):
+            add_library(vdf_root)
 
     return list(libraries.items())
 
@@ -306,7 +304,7 @@ def detect_running_games(
         except OSError:
             continue
 
-        if not raw_cmdline:
+        if not raw_cmdline or b"SteamLaunch" not in raw_cmdline:
             continue
 
         argv = [

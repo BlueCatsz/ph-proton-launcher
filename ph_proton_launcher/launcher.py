@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import time
@@ -73,7 +74,10 @@ def build_launch_command(
     if not clean_appid.isdigit():
         raise ValueError(f"AppID must be numeric, got {appid!r}")
 
-    resolved_exe = Path(exe_path).expanduser()
+    raw_exe = Path(exe_path).expanduser()
+    resolved_exe = (
+        raw_exe.resolve() if raw_exe.exists() else Path(os.path.abspath(str(raw_exe)))
+    )
     prefix = list(launcher_prefix) if launcher_prefix else ["protontricks-launch"]
 
     # Automatically expose the executable directory to Flatpak Protontricks.
@@ -111,12 +115,12 @@ def validate_launch_inputs(
 
     exe_str = str(exe_path).strip()
     if not exe_str:
-        return ("Specify the path to ProcessHacker.exe.", None)
+        return ("Specify the path to ProcessHacker.exe or SystemInformer.exe.", None)
 
     resolved_exe = Path(exe_str).expanduser()
     if not resolved_exe.is_file():
         return (
-            f"Process Hacker executable was not found:\n{resolved_exe}",
+            f"{tool_display_name(exe_str)} executable was not found:\n{resolved_exe}",
             None,
         )
 

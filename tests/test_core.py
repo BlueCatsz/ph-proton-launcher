@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import urllib.request
 import zipfile
 from pathlib import Path
 from unittest import mock
@@ -32,6 +33,7 @@ from ph_proton_launcher.downloader import (
     TOOL_SYSTEM_INFORMER,
     DownloadResult,
     _safe_extract_zip,
+    _TrustedRedirectHandler,
     _validate_download_url,
     download_and_install_tool,
     find_executable_in_dir,
@@ -163,6 +165,39 @@ class VdfAndSteamTests(unittest.TestCase):
             self.assertEqual(resolve_game_name("300", vdf_path=vdf), 'Warframe "Test"')
             self.assertEqual(resolve_game_name("200", vdf_path=vdf), "Unknown Game")
 
+    def test_get_steam_libraries_aggregates_multiple_existing_vdf_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            native_steam = root / "native_steam"
+            flatpak_steam = root / "flatpak_steam"
+            extra_lib = root / "extra_lib"
+            (native_steam / "steamapps").mkdir(parents=True)
+            (flatpak_steam / "steamapps").mkdir(parents=True)
+            (extra_lib / "steamapps").mkdir(parents=True)
+
+            vdf1 = native_steam / "steamapps" / "libraryfolders.vdf"
+            vdf1.write_text(
+                f'"libraryfolders" {{ "0" {{ "path" "{native_steam}" "apps" {{ "100" "1" }} }} }}',
+                encoding="utf-8",
+            )
+            vdf2 = flatpak_steam / "steamapps" / "libraryfolders.vdf"
+            vdf2.write_text(
+                f'"libraryfolders" {{ "0" {{ "path" "{extra_lib}" "apps" {{ "200" "1" }} }} }}',
+                encoding="utf-8",
+            )
+            (extra_lib / "steamapps" / "appmanifest_200.acf").write_text(
+                '"AppState" { "appid" "200" "name" "Flatpak Library Game" }',
+                encoding="utf-8",
+            )
+
+            with mock.patch("ph_proton_launcher.steam.DEFAULT_STEAM_VDF_PATHS", (vdf1, vdf2)):
+                libs = get_steam_libraries()
+                lib_paths = [path for path, _ in libs]
+                self.assertIn(native_steam, lib_paths)
+                self.assertIn(extra_lib, lib_paths)
+                self.assertIn(flatpak_steam, lib_paths)
+                self.assertEqual(resolve_game_name("200"), "Flatpak Library Game")
+
     def test_detect_running_games_scans_proc_and_deduplicates(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -225,7 +260,24 @@ class DownloaderTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             _validate_download_url("https://evil.example.com/file.zip")
 
-    def test_safe_extract_zip_blocks_zip_slip_and_extracts_valid_files(self) -> None:
+    def test_trusted_redirect_handler_blocks_untrusted_hops(self) -> None:
+        handler = _TrustedRedirectHandler()
+        req = urllib.request.Request("https://sourceforge.net/projects/processhacker/download")
+        with self.assertRaises(ValueError):
+            handler.redirect_request(req, None, 302, "Found", {}, "http://github.com/evil.zip")
+        with self.assertRaises(ValueError):
+            handler.redirect_request(req, None, 302, "Found", {}, "https://evil.example.com/evil.zip")
+        redirected = handler.redirect_request(
+            req,
+            None,
+            302,
+            "Found",
+            {},
+            "https://cfhcable.dl.sourceforge.net/project/processhacker/processhacker-2.39-bin.zip",
+        )
+        self.assertIsNotNone(redirected)
+
+    def test_safe_extract_zip_blocks_zip_slip_zip_bomb_and_extracts_valid_files(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             evil_zip = root / "evil.zip"
@@ -237,6 +289,11 @@ class DownloaderTests(unittest.TestCase):
             abs_zip.write_bytes(_make_zip_bytes({"/tmp/abs.txt": b"bad"}))
             with self.assertRaises(ValueError):
                 _safe_extract_zip(abs_zip, root / "out2")
+
+            bomb_zip = root / "bomb.zip"
+            bomb_zip.write_bytes(_make_zip_bytes({"big.bin": b"A" * 2048}))
+            with self.assertRaises(ValueError):
+                _safe_extract_zip(bomb_zip, root / "bomb_out", max_extracted_bytes=1024)
 
             good_zip = root / "good.zip"
             good_zip.write_bytes(
@@ -358,6 +415,25 @@ class ConfigAndLauncherTests(unittest.TestCase):
             with mock.patch("ph_proton_launcher.config.DEFAULT_EXE_CANDIDATES", (missing,)):
                 self.assertEqual(detect_default_exe(), DEFAULT_PROCESS_HACKER_EXE)
 
+    def test_detect_default_exe_honors_runtime_xdg_data_home(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            xdg_data = root / "xdg_data"
+            fake_home = root / "home"
+            fake_home.mkdir()
+            managed_exe = (
+                xdg_data / "ph-proton-launcher" / "tools" / "system-informer" / "amd64" / "SystemInformer.exe"
+            )
+            managed_exe.parent.mkdir(parents=True)
+            managed_exe.write_bytes(b"MZ")
+
+            with (
+                mock.patch("ph_proton_launcher.config.Path.home", return_value=fake_home),
+                mock.patch("ph_proton_launcher.downloader.Path.home", return_value=fake_home),
+                mock.patch.dict(os.environ, {"XDG_DATA_HOME": str(xdg_data)}, clear=False),
+            ):
+                self.assertEqual(detect_default_exe(), str(managed_exe))
+
     def test_resolve_protontricks_command_native_and_flatpak(self) -> None:
         with mock.patch(
             "ph_proton_launcher.launcher.shutil.which",
@@ -414,6 +490,26 @@ class ConfigAndLauncherTests(unittest.TestCase):
                 "/tmp/tools/SystemInformer.exe",
             ],
         )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            real_dir = Path(tmp) / "real"
+            real_dir.mkdir()
+            real_exe = real_dir / "SystemInformer.exe"
+            real_exe.write_bytes(b"MZ")
+            link_exe = Path(tmp) / "link.exe"
+            link_exe.symlink_to(real_exe)
+            symlink_cmd = build_launch_command(
+                "230410",
+                link_exe,
+                launcher_prefix=[
+                    "flatpak",
+                    "run",
+                    "--command=protontricks-launch",
+                    FLATPAK_PROTONTRICKS_APP_ID,
+                ],
+            )
+            self.assertIn(f"--filesystem={real_dir.resolve()}", symlink_cmd)
+            self.assertEqual(symlink_cmd[-1], str(real_exe.resolve()))
 
     def test_build_command_verbose_and_validation(self) -> None:
         cmd = build_launch_command("230410", "~/ProcessHacker/x64/ProcessHacker.exe")
@@ -718,6 +814,55 @@ class HeadlessGuiTests(unittest.TestCase):
             self.assertIn("stdout line", log_text)
             self.assertIn("stderr line", log_text)
             self.assertIn("[finished] exit code 0", log_text)
+            win.deleteLater()
+
+    def test_stop_button_suppresses_error_dialog_and_close_progress_dialog_blocks_cancel(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg_path = Path(tmp) / "config.json"
+            win = MainWindow(
+                config=AppConfig(),
+                config_path=cfg_path,
+                start_verbose=True,
+                initial_games=[],
+            )
+
+            started_loop = QEventLoop()
+            finished_loop = QEventLoop()
+            win.process.started.connect(started_loop.quit)
+            win.process.finished.connect(lambda _code, _status: finished_loop.quit())
+            QTimer.singleShot(5000, started_loop.quit)
+            QTimer.singleShot(5000, finished_loop.quit)
+
+            with mock.patch("ph_proton_launcher.ui.show_error_dialog") as mock_err:
+                win.start_command(
+                    sys.executable,
+                    ["-c", "import time; time.sleep(30)"],
+                    target_label="Long Process",
+                )
+                started_loop.exec()
+                self.assertEqual(win.stop_button.text(), "Stop")
+                win.stop_button.click()
+                self.assertEqual(win.stop_button.text(), "Kill")
+                finished_loop.exec()
+                QApplication.processEvents()
+
+                mock_err.assert_not_called()
+                self.assertTrue(win.stop_button.isHidden())
+                self.assertEqual(win.stop_button.text(), "Stop")
+                self.assertIn("Stopped ", win.status_label.text())
+                self.assertIn("[stop] Sent SIGTERM", win.log_view.toPlainText())
+
+            # Closing progress dialog on completion must not emit canceled
+            from PyQt6.QtWidgets import QProgressDialog
+
+            dlg = QProgressDialog("Downloading…", "Cancel", 0, 100, win)
+            cancel_calls: list[bool] = []
+            dlg.canceled.connect(lambda: cancel_calls.append(True))
+            win._progress_dialog = dlg
+            win._close_progress_dialog()
+            QApplication.processEvents()
+            self.assertEqual(cancel_calls, [])
+
             win.deleteLater()
 
 
