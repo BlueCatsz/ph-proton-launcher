@@ -253,6 +253,7 @@ class MainWindow(QMainWindow):
         )
         self.games_list.setAlternatingRowColors(True)
         self.games_list.itemClicked.connect(self._on_game_clicked)
+        self.games_list.currentItemChanged.connect(self._on_game_current_changed)
         self.games_list.itemDoubleClicked.connect(self._on_game_double_clicked)
         root.addWidget(self.games_list)
 
@@ -566,18 +567,20 @@ class MainWindow(QMainWindow):
     def _on_download_failed(self, error_text: str) -> None:
         self._close_progress_dialog()
         self.status_label.setText(f"Download failed: {error_text}")
-        show_error_dialog(
-            "Download Failed",
-            f"Could not download {self._download_label}.",
-            error_text,
-            parent=self,
-        )
+        if not self._quit_on_finish:
+            show_error_dialog(
+                "Download Failed",
+                f"Could not download {self._download_label}.",
+                error_text,
+                parent=self,
+            )
 
     def _on_download_thread_finished(self) -> None:
         if self._download_thread is not None:
             self._download_thread.deleteLater()
         self._download_thread = None
         self._download_worker = None
+        self._maybe_quit_if_idle()
 
     def _prompt_download_missing_tool(self, exe_path: str) -> bool:
         """Offer automatic download when the configured executable path does not exist."""
@@ -616,6 +619,14 @@ class MainWindow(QMainWindow):
 
     def _on_game_clicked(self, item: QListWidgetItem) -> None:
         if item.data(Qt.ItemDataRole.UserRole):
+            self.manual_appid_input.clear()
+
+    def _on_game_current_changed(
+        self,
+        current: QListWidgetItem | None,
+        _previous: QListWidgetItem | None,
+    ) -> None:
+        if current is not None and current.isSelected() and current.data(Qt.ItemDataRole.UserRole):
             self.manual_appid_input.clear()
 
     def _on_game_double_clicked(self, item: QListWidgetItem) -> None:
@@ -803,8 +814,7 @@ class MainWindow(QMainWindow):
                 self._collected_output() or err_text,
                 parent=None if self.isHidden() else self,
             )
-            if self._quit_on_finish:
-                QApplication.quit()
+            self._maybe_quit_if_idle()
 
     def _on_process_finished(
         self, exit_code: int, exit_status: QProcess.ExitStatus
@@ -854,20 +864,30 @@ class MainWindow(QMainWindow):
                     parent=None if self.isHidden() else self,
                 )
 
-        if self._quit_on_finish:
+        self._maybe_quit_if_idle()
+
+    def _maybe_quit_if_idle(self) -> None:
+        if not self._quit_on_finish:
+            return
+        process_running = self.process.state() != QProcess.ProcessState.NotRunning
+        download_running = (
+            self._download_thread is not None and self._download_thread.isRunning()
+        )
+        if not process_running and not download_running:
             QApplication.quit()
 
     def closeEvent(self, event) -> None:
-        """Hide instead of terminating ``QProcess`` if a launch is still active."""
+        """Hide instead of terminating ``QProcess`` or destroying an active download thread."""
         self._persist_exe_path()
+        download_active = False
         if self._download_thread is not None and self._download_thread.isRunning():
             if self._download_worker is not None:
                 self._download_worker.cancel()
             self._close_progress_dialog()
             self._download_thread.quit()
-            self._download_thread.wait(2000)
+            download_active = not self._download_thread.wait(2000)
 
-        if self.process.state() != QProcess.ProcessState.NotRunning:
+        if download_active or self.process.state() != QProcess.ProcessState.NotRunning:
             self._quit_on_finish = True
             event.ignore()
             self.hide()

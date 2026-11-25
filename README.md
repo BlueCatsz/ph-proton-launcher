@@ -1,6 +1,6 @@
 # Process Hacker Proton Launcher
 
-[![CI](https://github.com/BlueDragonReal/ph-proton-launcher/actions/workflows/ci.yml/badge.svg)](https://github.com/BlueDragonReal/ph-proton-launcher/actions/workflows/ci.yml)
+[![CI](https://github.com/BlueCatsz/ph-proton-launcher/actions/workflows/ci.yml/badge.svg)](https://github.com/BlueCatsz/ph-proton-launcher/actions/workflows/ci.yml)
 
 A lightweight PyQt6 Linux desktop utility (Wayland & X11, native KDE Plasma integration) for launching **Process Hacker**, **System Informer**, or any custom Windows `.exe` directly inside a running Steam Proton prefix via `protontricks-launch`.
 
@@ -69,7 +69,7 @@ This tool is intended for **debugging, inspecting Proton/Wine threads, loaded DL
 No `sudo` is required. Everything installs cleanly into your user home directories (`~/.local/share/ph-proton-launcher/` and `~/.local/share/applications/ph-proton-launcher.desktop`).
 
 ```bash
-git clone https://github.com/BlueDragonReal/ph-proton-launcher.git
+git clone https://github.com/BlueCatsz/ph-proton-launcher.git
 cd ph-proton-launcher
 ./install.sh
 ```

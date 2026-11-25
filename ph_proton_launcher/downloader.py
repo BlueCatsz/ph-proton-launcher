@@ -113,7 +113,7 @@ def _extract_sha256_digest(asset: dict[str, Any]) -> str | None:
     digest = asset.get("digest")
     if isinstance(digest, str) and digest.lower().startswith("sha256:"):
         hex_value = digest.split(":", 1)[1].strip().lower()
-        if len(hex_value) == 64:
+        if len(hex_value) == 64 and all(ch in "0123456789abcdef" for ch in hex_value):
             return hex_value
     return None
 
@@ -242,7 +242,7 @@ def _safe_extract_zip(
             if target != dest_root and dest_root not in target.parents:
                 raise ValueError(f"Archive member escapes target directory: {info.filename!r}")
 
-            if info.is_dir():
+            if info.is_dir() or member_name.endswith("/") or target == dest_root:
                 target.mkdir(parents=True, exist_ok=True)
                 continue
 
@@ -330,7 +330,8 @@ def download_and_install_tool(
                 _validate_download_url(final_url)
 
             raw_length = resp.headers.get("Content-Length") if hasattr(resp, "headers") else None
-            total_bytes = int(raw_length) if raw_length and str(raw_length).isdigit() else -1
+            raw_str = str(raw_length).strip() if raw_length is not None else ""
+            total_bytes = int(raw_str) if raw_str.isdigit() else -1
             if total_bytes > MAX_DOWNLOAD_BYTES:
                 raise ValueError(
                     f"Remote archive size ({total_bytes} bytes) exceeds {MAX_DOWNLOAD_BYTES} byte limit."
@@ -365,7 +366,15 @@ def download_and_install_tool(
         rel_exe = staged_exe.relative_to(staging_dir)
 
         portable_marker = staged_exe.parent / f"{staged_exe.name}.settings.xml"
-        portable_marker.touch(exist_ok=True)
+        existing_settings = target_dir / rel_exe.parent / portable_marker.name
+        if (
+            existing_settings.is_file()
+            and not existing_settings.is_symlink()
+            and existing_settings.stat().st_size > 0
+        ):
+            shutil.copy2(existing_settings, portable_marker)
+        else:
+            portable_marker.touch(exist_ok=True)
 
         shutil.rmtree(backup_dir, ignore_errors=True)
         moved_existing = False

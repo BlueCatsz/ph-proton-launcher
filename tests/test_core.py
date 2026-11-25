@@ -17,6 +17,7 @@ from pathlib import Path
 from unittest import mock
 
 from PyQt6.QtCore import QEventLoop, QTimer
+from PyQt6.QtGui import QCloseEvent
 from PyQt6.QtWidgets import QApplication
 
 from ph_proton_launcher import __main__ as cli_main
@@ -307,6 +308,22 @@ class DownloaderTests(unittest.TestCase):
             exe = find_executable_in_dir(out_dir, "ProcessHacker.exe")
             self.assertEqual(exe, out_dir / "x64" / "ProcessHacker.exe")
 
+            win_dir_zip = root / "win_dir.zip"
+            win_dir_zip.write_bytes(
+                _make_zip_bytes({
+                    ".": b"",
+                    "x64\\": b"",
+                    "x64\\ProcessHacker.exe": b"MZ",
+                })
+            )
+            win_out = root / "win_out"
+            _safe_extract_zip(win_dir_zip, win_out)
+            self.assertTrue((win_out / "x64").is_dir())
+            self.assertEqual(
+                find_executable_in_dir(win_out, "ProcessHacker.exe"),
+                win_out / "x64" / "ProcessHacker.exe",
+            )
+
     def test_select_system_informer_asset_prefers_64bit_and_extracts_digest(self) -> None:
         payload = {
             "tag_name": "v4.0.26241.138",
@@ -326,6 +343,18 @@ class DownloaderTests(unittest.TestCase):
         self.assertEqual(asset.version, "v4.0.26241.138")
         self.assertEqual(asset.exe_name, "SystemInformer.exe")
         self.assertEqual(asset.expected_sha256, "a" * 64)
+
+        bad_hex_payload = {
+            "tag_name": "v4.0.26241.138",
+            "assets": [
+                {
+                    "name": "systeminformer-4.0.26241.138-bin.zip",
+                    "browser_download_url": "https://github.com/winsiderss/systeminformer/releases/download/v4/bin.zip",
+                    "digest": "sha256:" + ("z" * 64),
+                },
+            ],
+        }
+        self.assertIsNone(select_system_informer_asset(bad_hex_payload).expected_sha256)
 
     def test_download_and_install_tool_verifies_sha256_and_sets_portable_mode(self) -> None:
         si_zip = _make_zip_bytes(
@@ -368,6 +397,19 @@ class DownloaderTests(unittest.TestCase):
             self.assertTrue((result.exe_path.parent / "SystemInformer.exe.settings.xml").is_file())
             self.assertEqual(result.sha256, si_sha)
             self.assertTrue(progress_events)
+
+            # Re-installing preserves existing non-empty portable settings XML
+            settings_file = result.exe_path.parent / "SystemInformer.exe.settings.xml"
+            settings_file.write_bytes(b"<settings><dark>1</dark></settings>")
+            reinstalled = download_and_install_tool(
+                TOOL_SYSTEM_INFORMER,
+                tools_dir=tools_dir,
+                opener=fake_opener,
+            )
+            self.assertEqual(
+                (reinstalled.exe_path.parent / "SystemInformer.exe.settings.xml").read_bytes(),
+                b"<settings><dark>1</dark></settings>",
+            )
 
             # Corrupt SHA-256 fails for Process Hacker 2.39
             bad_ph_zip = _make_zip_bytes({"x64/ProcessHacker.exe": b"BAD"})
@@ -992,6 +1034,50 @@ class HeadlessGuiTests(unittest.TestCase):
                 with self.assertRaises(ProcessLookupError):
                     os.kill(child_pid, 0)
 
+            win.deleteLater()
+
+    def test_keyboard_selection_clears_manual_appid_and_close_hides_during_download(self) -> None:
+        games = [SteamGame("620", "Portal 2"), SteamGame("230410", "Warframe")]
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg_path = Path(tmp) / "config.json"
+            win = MainWindow(
+                config=AppConfig(),
+                config_path=cfg_path,
+                start_verbose=False,
+                initial_games=games,
+            )
+            win.manual_appid_input.setText("999999")
+            win._on_manual_appid_edited("999999")
+            self.assertEqual(win.selected_appid(), "999999")
+
+            # Changing current row (e.g. keyboard navigation) clears manual AppID
+            win.games_list.setCurrentRow(0)
+            self.assertEqual(win.manual_appid_input.text(), "")
+            self.assertEqual(win.selected_appid(), "620")
+
+            # Closing while a download thread is still running must hide and defer quit
+            fake_thread = mock.Mock()
+            fake_thread.isRunning.return_value = True
+            fake_thread.wait.return_value = False
+            fake_worker = mock.Mock()
+            win._download_thread = fake_thread
+            win._download_worker = fake_worker
+
+            win.show()
+            event = QCloseEvent()
+            with mock.patch("ph_proton_launcher.ui.QApplication.quit") as mock_quit:
+                win.closeEvent(event)
+
+            self.assertFalse(event.isAccepted())
+            self.assertTrue(win.isHidden())
+            self.assertTrue(win._quit_on_finish)
+            fake_worker.cancel.assert_called_once()
+            fake_thread.quit.assert_called_once()
+            fake_thread.wait.assert_called_once_with(2000)
+            mock_quit.assert_not_called()
+
+            win._download_thread = None
+            win._download_worker = None
             win.deleteLater()
 
 
